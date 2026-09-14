@@ -1,4 +1,5 @@
 import inspect
+import threading
 
 import pytest
 
@@ -482,3 +483,30 @@ def test_breeze_generate_preserves_existing_positional_arguments():
     assert bound.arguments["temperature"] == 0.4
     assert bound.arguments["streaming_interval"] == 0.5
     assert "split_pattern" not in bound.arguments
+
+
+def test_sampler_varies_on_worker_threads_and_is_reproducible_with_a_key():
+    """mlx-lm's compiled sampler freezes on non-main threads; ours must not."""
+    model = Model(tiny_config())
+    logits = mx.log(mx.array([[0.05, 0.1, 0.15, 0.2, 0.05, 0.1, 0.15, 0.2]]))
+    mx.eval(logits)  # the first evaluation in a process must happen on the main thread
+
+    def draws(sampler, n=12):
+        return [int(model._sample_array(logits, sampler=sampler, valid=8).item()) for _ in range(n)]
+
+    results = {}
+
+    def body():
+        results["a"] = draws(model._make_sampler(0.9, 1.0, 4, 8))
+        results["b"] = draws(model._make_sampler(0.9, 1.0, 4, 8))
+
+    thread = threading.Thread(target=body)
+    thread.start()
+    thread.join()
+    assert len(set(results["a"])) > 1, "sampler returned one token forever on a worker thread"
+    assert results["a"] != results["b"], "two unseeded samplers drew identical sequences"
+
+    seeded_1 = draws(model._make_sampler(0.9, 1.0, 4, 8, key=mx.random.key(3)))
+    seeded_2 = draws(model._make_sampler(0.9, 1.0, 4, 8, key=mx.random.key(3)))
+    assert seeded_1 == seeded_2
+    assert max(seeded_1) <= 7 and all(t in (3, 7, 2, 6) for t in seeded_1)  # top-4 of the distribution only

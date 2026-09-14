@@ -8,6 +8,7 @@ no PyTorch or upstream Breeze runtime is required at inference time.
 
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -21,11 +22,50 @@ from mlx_audio.lm.models import llama, qwen3
 from mlx_audio.lm.models.base import create_attention_mask, scaled_dot_product_attention
 from mlx_audio.lm.models.cache import KVCache
 from mlx_audio.lm.models.rope_utils import initialize_rope
-from mlx_audio.lm.sample_utils import make_sampler
 from mlx_audio.tts.models.base import GenerationResult
 from mlx_audio.utils import load_audio
 
 from .config import ModelConfig
+
+
+def _keyed_sampler(
+    temperature: float, top_p: float, top_k: int, key: Optional[mx.array] = None
+):
+    """Temperature / top-k / top-p sampler built from plain ops with its own key.
+
+    mlx-lm's ``make_sampler`` is ``mx.compile``d with ``mx.random.state`` as
+    captured inputs/outputs. On any non-main thread that compiled function
+    returns the same token on every call and ignores ``mx.random.seed`` (the
+    state write-back never lands), so a server that generates on worker
+    threads would produce identical audio for identical text, and a sentence
+    that gets stuck would get stuck on every run. This sampler keeps an
+    explicit key and splits it per draw instead. The key must be created on
+    the thread that uses it.
+    """
+    if temperature == 0:
+        return lambda logprobs: mx.argmax(logprobs, axis=-1)
+    if key is None:
+        key = mx.random.key(int.from_bytes(os.urandom(4), "little"))
+    state = {"key": key}
+
+    def sampler(logprobs: mx.array) -> mx.array:
+        if top_k > 0 and top_k < logprobs.shape[-1]:
+            kth = mx.sort(logprobs, axis=-1)[..., -top_k : -top_k + 1]
+            logprobs = mx.where(logprobs < kth, -mx.inf, logprobs)
+        if 0 < top_p < 1:
+            order = mx.argsort(-logprobs, axis=-1)
+            ranked = mx.take_along_axis(logprobs, order, axis=-1)
+            probs = mx.exp(ranked)
+            before = mx.cumsum(probs, axis=-1) - probs
+            keep_ranked = before < top_p
+            keep = mx.put_along_axis(
+                mx.zeros(logprobs.shape, dtype=mx.bool_), order, keep_ranked, axis=-1
+            )
+            logprobs = mx.where(keep, logprobs, -mx.inf)
+        state["key"], sub = mx.random.split(state["key"])
+        return mx.random.categorical(logprobs / temperature, key=sub)
+
+    return sampler
 
 
 def _split_long_segment(text: str, max_chars: int = 600) -> list[str]:
@@ -904,8 +944,18 @@ class Model(nn.Module):
                 embeddings.append(self.backbone_model.embed_tokens(eos_codes))
         return mx.concatenate(embeddings, axis=1)
 
-    def _make_sampler(self, temperature: float, top_p: float, top_k: int, valid: int):
-        """Build a sampler over the first ``valid`` logit columns."""
+    def _make_sampler(
+        self,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        valid: int,
+        key: Optional[mx.array] = None,
+    ):
+        """Build a sampler over the first ``valid`` logit columns.
+
+        ``key`` seeds the sampler; without one a fresh random key is used.
+        """
         if temperature < 0:
             raise ValueError("temperature must be non-negative")
         if not 0 <= top_p <= 1:
@@ -917,7 +967,7 @@ class Model(nn.Module):
         effective_top_k = min(top_k, valid) if top_k else 0
         if effective_top_k == valid:
             effective_top_k = 0
-        return make_sampler(temp=temperature, top_p=top_p, top_k=effective_top_k)
+        return _keyed_sampler(temperature, top_p, effective_top_k, key)
 
     def _sample_array(self, logits: mx.array, *, sampler, valid: int) -> mx.array:
         """Sample one token per row without leaving the device.
@@ -1155,6 +1205,10 @@ class Model(nn.Module):
         """
         if seed is not None:
             mx.random.seed(seed)
+            base_key = mx.random.key(seed)
+        else:
+            base_key = mx.random.key(int.from_bytes(os.urandom(4), "little"))
+        first_key, depth_key = mx.random.split(base_key)
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive.")
         if top_k < 0:
@@ -1199,9 +1253,11 @@ class Model(nn.Module):
         scale = 1.0 if cfg_scale is None else cfg_scale
         batch = 2 if use_cfg else 1
         first_sampler = self._make_sampler(
-            temperature, top_p, top_k, self.vocab_size + 1
+            temperature, top_p, top_k, self.vocab_size + 1, key=first_key
         )
-        depth_sampler = self._make_sampler(temperature, top_p, top_k, self.vocab_size)
+        depth_sampler = self._make_sampler(
+            temperature, top_p, top_k, self.vocab_size, key=depth_key
+        )
 
         total_segments = len(segments)
         for segment_idx, segment_text in enumerate(segments):
