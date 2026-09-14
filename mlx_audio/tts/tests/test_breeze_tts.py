@@ -154,15 +154,16 @@ def test_depth_cfg_applies_to_every_remaining_codebook(monkeypatch):
     model = Model(tiny_config())
     sampled_logits = []
 
-    def next_logits(_token_ids, hidden):
-        return mx.full((1, 8), hidden[0, 0])
+    def next_logits(_token_ids, hidden, cache=None):
+        # Row 0 is the conditional prompt, row 1 the unconditional one.
+        return mx.broadcast_to(hidden[:, :1], (hidden.shape[0], 8))
 
-    def sample(logits, **_kwargs):
+    def sample_array(logits, **_kwargs):
         sampled_logits.append(logits)
-        return 1
+        return mx.array([1], dtype=mx.int32)
 
     monkeypatch.setattr(model.depth_decoder, "next_logits", next_logits)
-    monkeypatch.setattr(model, "_sample", sample)
+    monkeypatch.setattr(model, "_sample_array", sample_array)
     tokens = model._depth_tokens(
         1,
         mx.ones((1, 16)),
@@ -182,15 +183,17 @@ def test_depth_cfg_masks_reserved_tokens_at_every_step(monkeypatch):
     model = Model(tiny_config())
     sampled_logits = []
 
-    def next_logits(_token_ids, _hidden):
-        return mx.arange(8, dtype=mx.float32)[None, :]
+    def next_logits(_token_ids, hidden, cache=None):
+        return mx.broadcast_to(
+            mx.arange(8, dtype=mx.float32)[None, :], (hidden.shape[0], 8)
+        )
 
-    def sample(logits, **_kwargs):
+    def sample_array(logits, **_kwargs):
         sampled_logits.append(logits)
-        return 1
+        return mx.array([1], dtype=mx.int32)
 
     monkeypatch.setattr(model.depth_decoder, "next_logits", next_logits)
-    monkeypatch.setattr(model, "_sample", sample)
+    monkeypatch.setattr(model, "_sample_array", sample_array)
     model._depth_tokens(
         1,
         mx.ones((1, 16)),
@@ -301,9 +304,6 @@ def test_stream_flushes_at_exact_interval_and_resets_state(monkeypatch):
     model.audio_tokenizer = AudioTokenizer()
     monkeypatch.setattr(
         model, "_prompt_embeddings", lambda *_args, **_kwargs: mx.zeros((1, 1, 16))
-    )
-    monkeypatch.setattr(
-        model, "_depth_tokens", lambda first, *_args, **_kwargs: [first, 2, 3]
     )
     model.lm_head = Head()
 

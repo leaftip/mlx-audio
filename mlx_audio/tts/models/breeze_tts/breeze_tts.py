@@ -172,6 +172,7 @@ class _Backbone(nn.Module):
         *,
         input_embeddings: Optional[mx.array] = None,
         cache: Optional[list[KVCache]] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         if (input_ids is None) == (input_embeddings is None):
             raise ValueError("Pass exactly one of input_ids or input_embeddings.")
@@ -182,7 +183,10 @@ class _Backbone(nn.Module):
         )
         if cache is None:
             cache = [None] * len(self.layers)
-        mask = create_attention_mask(hidden, cache[0])
+        # An explicit mask lets batched prompts of different lengths share one
+        # cache: left-padded positions are excluded as keys.
+        if mask is None:
+            mask = create_attention_mask(hidden, cache[0])
         for layer, layer_cache in zip(self.layers, cache):
             hidden = layer(hidden, mask, layer_cache)
         return self.norm(hidden)
@@ -201,7 +205,11 @@ class _TextEmbedding(nn.Module):
         self.eoi_token_index = eoi_token_index
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        embeds = self.weight[input_ids] * mx.array(self.weight.shape[-1] ** 0.5)
+        # Scale with a Python float so the result keeps the weight dtype.  An
+        # ``mx.array`` scalar is float32 and would promote the embeddings, and
+        # with them the text encoder, backbone, KV cache, and depth decoder,
+        # to float32, roughly quadrupling per-frame memory traffic.
+        embeds = self.weight[input_ids] * (self.weight.shape[-1] ** 0.5)
         return mx.where(
             (input_ids == self.eoi_token_index)[..., None], self.eoi_embedding, embeds
         )
@@ -482,6 +490,29 @@ class _TextEncoder(nn.Module):
         return self.norm(hidden)
 
 
+class _ConcatKVCache:
+    """Minimal KV cache for the depth decoder's sequence of at most 16 tokens.
+
+    ``KVCache`` preallocates 256-slot buffers and scatters into them, which is
+    right for long backbone sequences but costs two scatter kernels per layer
+    per step here.  Concatenating a handful of tiny arrays is cheaper.
+    """
+
+    def __init__(self):
+        self.keys: Optional[mx.array] = None
+        self.values: Optional[mx.array] = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if self.keys is None:
+            self.keys, self.values = keys, values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
+        self.offset += keys.shape[2]
+        return self.keys, self.values
+
+
 class _DepthModel(nn.Module):
     """Breeze's codebook-autoregressive depth decoder."""
 
@@ -529,9 +560,16 @@ class _DepthModel(nn.Module):
             llama.TransformerBlock(args) for _ in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
+        # Embedding-row offset for each sequence position (placeholder, then
+        # codebooks 0..N-2), precomputed so a step costs one add and one gather.
+        positions = mx.maximum(mx.arange(self.num_codebooks + 1) - 1, 0)
+        self._codebook_offsets = (positions * self.vocab_size).astype(mx.int32)
 
     def __call__(
-        self, token_ids: mx.array, backbone_hidden_state: mx.array
+        self,
+        token_ids: mx.array,
+        backbone_hidden_state: mx.array,
+        cache: Optional[list] = None,
     ) -> mx.array:
         if token_ids.ndim != 2:
             raise ValueError(
@@ -547,22 +585,33 @@ class _DepthModel(nn.Module):
                 "Depth decoder token and hidden-state batch sizes differ: "
                 f"{token_ids.shape[0]} != {backbone_hidden_state.shape[0]}."
             )
+        # With a cache, ``token_ids`` holds only the tokens not yet seen and
+        # ``offset`` is how many positions the cache already contains.
+        offset = cache[0].offset if cache else 0
+        length = token_ids.shape[1]
         # token_ids starts with a placeholder. Position zero is replaced by the
         # backbone state, while later positions carry codebook-specific offsets.
-        positions = mx.maximum(mx.arange(token_ids.shape[1]) - 1, 0)
-        embeds = self.embed_tokens(token_ids + positions[None, :] * self.vocab_size)
-        if self.backbone_hidden_state_projector is not None:
-            backbone_hidden_state = self.backbone_hidden_state_projector(
-                backbone_hidden_state
-            )
-        embeds = mx.concatenate(
-            [backbone_hidden_state[:, None, :], embeds[:, 1:, :]], axis=1
+        embeds = self.embed_tokens(
+            token_ids + self._codebook_offsets[offset : offset + length]
         )
+        if offset == 0:
+            if self.backbone_hidden_state_projector is not None:
+                backbone_hidden_state = self.backbone_hidden_state_projector(
+                    backbone_hidden_state
+                )
+            embeds = mx.concatenate(
+                [backbone_hidden_state[:, None, :], embeds[:, 1:, :]], axis=1
+            )
         hidden = self.inputs_embeds_projector(embeds)
-        mask = create_attention_mask(hidden, None)
-        for layer in self.layers:
-            hidden = layer(hidden, mask, None)
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = create_attention_mask(hidden, cache[0])
+        for layer, layer_cache in zip(self.layers, cache):
+            hidden = layer(hidden, mask, layer_cache)
         return self.norm(hidden)
+
+    def make_cache(self) -> list[_ConcatKVCache]:
+        return [_ConcatKVCache() for _ in self.layers]
 
 
 class _DepthDecoder(nn.Module):
@@ -576,17 +625,24 @@ class _DepthDecoder(nn.Module):
         )
 
     def next_logits(
-        self, token_ids: mx.array, backbone_hidden_state: mx.array
+        self,
+        token_ids: mx.array,
+        backbone_hidden_state: mx.array,
+        cache: Optional[list] = None,
     ) -> mx.array:
         # The most recent input token is codebook N-1, and predicts codebook N.
-        head_idx = token_ids.shape[1] - 2
+        seen = cache[0].offset if cache else 0
+        head_idx = seen + token_ids.shape[1] - 2
         if not 0 <= head_idx < self.codebooks_head.weight.shape[0]:
             raise ValueError(
                 "Depth decoder input must contain the placeholder and at least "
-                f"one codebook token; got sequence length {token_ids.shape[1]}."
+                f"one codebook token; got sequence length {seen + token_ids.shape[1]}."
             )
-        hidden = self.model(token_ids, backbone_hidden_state)[:, -1, :]
+        hidden = self.model(token_ids, backbone_hidden_state, cache)[:, -1, :]
         return hidden @ self.codebooks_head.weight[head_idx]
+
+    def make_cache(self) -> list[_ConcatKVCache]:
+        return self.model.make_cache()
 
 
 class _CodebooksHead(nn.Module):
@@ -848,6 +904,34 @@ class Model(nn.Module):
                 embeddings.append(self.backbone_model.embed_tokens(eos_codes))
         return mx.concatenate(embeddings, axis=1)
 
+    def _make_sampler(self, temperature: float, top_p: float, top_k: int, valid: int):
+        """Build a sampler over the first ``valid`` logit columns."""
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if not 0 <= top_p <= 1:
+            raise ValueError("top_p must be between 0 and 1")
+        if not isinstance(top_k, int) or top_k < 0:
+            raise ValueError("top_k must be a non-negative integer")
+        # Clamp top-k to this distribution: tiny deterministic fixtures often
+        # use a vocab smaller than the user-facing default of 50.
+        effective_top_k = min(top_k, valid) if top_k else 0
+        if effective_top_k == valid:
+            effective_top_k = 0
+        return make_sampler(temp=temperature, top_p=top_p, top_k=effective_top_k)
+
+    def _sample_array(self, logits: mx.array, *, sampler, valid: int) -> mx.array:
+        """Sample one token per row without leaving the device.
+
+        ``logits`` must already have the reserved codec ids masked.  Keeping the
+        result as an array lets a whole frame be built lazily and evaluated once.
+        """
+        if logits.shape[-1] < valid:
+            raise ValueError(
+                "Breeze logits do not contain the expected codebook vocabulary: "
+                f"{logits.shape[-1]} < {valid}."
+            )
+        return sampler(nn.log_softmax(logits[..., :valid], axis=-1))
+
     def _sample(
         self,
         logits: mx.array,
@@ -857,31 +941,12 @@ class Model(nn.Module):
         top_k: int,
         allow_eos: bool = False,
     ) -> int:
-        if temperature < 0:
-            raise ValueError("temperature must be non-negative")
-        if not 0 <= top_p <= 1:
-            raise ValueError("top_p must be between 0 and 1")
-        if not isinstance(top_k, int) or top_k < 0:
-            raise ValueError("top_k must be a non-negative integer")
-
-        valid = self.vocab_size + 1 if allow_eos else self.vocab_size
-        if logits.shape[-1] < valid:
-            raise ValueError(
-                "Breeze logits do not contain the expected codebook vocabulary: "
-                f"{logits.shape[-1]} < {valid}."
-            )
-
         # Keep EOS as the one extra class used by the backbone while reserving
-        # padding/control ids in every regular codebook distribution.  Clamp
-        # top-k to this distribution: tiny deterministic fixtures often use a
-        # vocab smaller than the user-facing default of 50.
-        logits = self._mask_reserved_codec_logits(logits)[..., :valid]
-        effective_top_k = min(top_k, valid) if top_k else 0
-        if effective_top_k == valid:
-            effective_top_k = 0
-        sampler = make_sampler(temp=temperature, top_p=top_p, top_k=effective_top_k)
-        token = sampler(nn.log_softmax(logits, axis=-1))
-        return int(token.item())
+        # padding/control ids in every regular codebook distribution.
+        valid = self.vocab_size + 1 if allow_eos else self.vocab_size
+        sampler = self._make_sampler(temperature, top_p, top_k, valid)
+        logits = self._mask_reserved_codec_logits(logits)
+        return int(self._sample_array(logits, sampler=sampler, valid=valid).item())
 
     def _mask_reserved_codec_logits(self, logits: mx.array) -> mx.array:
         """Mask ids outside the codec codebook in a logits tensor.
@@ -903,20 +968,76 @@ class Model(nn.Module):
 
     @staticmethod
     def _apply_repetition_penalty(
-        logits: mx.array, generated_tokens: list[int], penalty: float
+        logits: mx.array,
+        generated_tokens: Union[list[int], mx.array],
+        penalty: float,
     ) -> mx.array:
-        """Apply the standard sign-aware repetition penalty to prior tokens."""
-        if penalty == 1.0 or not generated_tokens:
+        """Apply the standard sign-aware repetition penalty to prior tokens.
+
+        ``generated_tokens`` may be a lazy array so the frame loop never has to
+        synchronize just to read the history back.
+        """
+        if penalty == 1.0:
             return logits
-        token_ids = sorted(
-            {token for token in generated_tokens if 0 <= token < logits.shape[-1]}
-        )
-        if not token_ids:
-            return logits
-        indices = mx.array(token_ids, dtype=mx.int32)
+        if isinstance(generated_tokens, mx.array):
+            if generated_tokens.size == 0:
+                return logits
+            indices = generated_tokens.astype(mx.int32)
+        else:
+            if not generated_tokens:
+                return logits
+            token_ids = sorted(
+                {token for token in generated_tokens if 0 <= token < logits.shape[-1]}
+            )
+            if not token_ids:
+                return logits
+            indices = mx.array(token_ids, dtype=mx.int32)
         selected = mx.take(logits, indices, axis=-1)
         penalized = mx.where(selected < 0, selected * penalty, selected / penalty)
         return mx.put_along_axis(logits, indices[None, :], penalized, axis=-1)
+
+    @staticmethod
+    def _cfg_mix(logits: mx.array, cfg_scale: float) -> mx.array:
+        """Combine a [conditional, unconditional] logit batch into one row."""
+        if logits.shape[0] == 1:
+            return logits
+        conditional, unconditional = logits[0:1], logits[1:2]
+        return unconditional + cfg_scale * (conditional - unconditional)
+
+    def _depth_frame(
+        self,
+        first: mx.array,
+        hidden: mx.array,
+        *,
+        cfg_scale: float,
+        sampler,
+    ) -> mx.array:
+        """Decode the remaining codebooks of one frame entirely on device.
+
+        ``first`` is the sampled first codebook with shape ``[1]`` and
+        ``hidden`` the backbone state, ``[1, hidden]`` or ``[2, hidden]`` for a
+        (conditional, unconditional) guidance pair.  Both rows see the same
+        tokens; their logits are mixed with ``cfg_scale`` before sampling.  The
+        depth decoder keeps a KV cache so every step after the first processes a
+        single token.  Returns ``[1, num_codebooks]`` int32.
+        """
+        batch = hidden.shape[0]
+        cache = self.depth_decoder.make_cache()
+        first = first.astype(mx.int32)
+        tokens = [first]
+        token_ids = mx.concatenate([mx.zeros((1,), dtype=mx.int32), first])[None, :]
+        token_ids = mx.broadcast_to(token_ids, (batch, 2))
+        for _ in range(self.num_codebooks - 1):
+            logits = self.depth_decoder.next_logits(token_ids, hidden, cache=cache)
+            logits = self._cfg_mix(logits, cfg_scale)
+            # Apply the reserved-id mask before handing logits to the sampler so
+            # custom samplers and test doubles observe the official flow.
+            logits = self._mask_reserved_codec_logits(logits)
+            token = self._sample_array(logits, sampler=sampler, valid=self.vocab_size)
+            token = token.astype(mx.int32)
+            tokens.append(token)
+            token_ids = mx.broadcast_to(token[None, :], (batch, 1))
+        return mx.stack(tokens, axis=1)
 
     def _depth_tokens(
         self,
@@ -929,25 +1050,38 @@ class Model(nn.Module):
         top_p: float,
         top_k: int,
     ) -> list[int]:
-        tokens = [0, first_codebook]
-        for _ in range(self.num_codebooks - 1):
-            token_ids = mx.array(tokens, dtype=mx.int32)[None, :]
-            logits = self.depth_decoder.next_logits(token_ids, conditional_hidden)
-            if unconditional_hidden is not None:
-                unconditional_logits = self.depth_decoder.next_logits(
-                    token_ids, unconditional_hidden
-                )
-                logits = unconditional_logits + cfg_scale * (
-                    logits - unconditional_logits
-                )
-            # Apply the reserved-id mask before handing logits to the sampler.
-            # Keeping it here (as well as in ``_sample``) means custom samplers
-            # and deterministic test doubles observe the same official flow.
-            logits = self._mask_reserved_codec_logits(logits)
-            tokens.append(
-                self._sample(logits, temperature=temperature, top_p=top_p, top_k=top_k)
-            )
-        return tokens[1:]
+        """Eager convenience wrapper around :meth:`_depth_frame`."""
+        hidden = conditional_hidden
+        if unconditional_hidden is not None:
+            hidden = mx.concatenate([conditional_hidden, unconditional_hidden], axis=0)
+        sampler = self._make_sampler(temperature, top_p, top_k, self.vocab_size)
+        frame = self._depth_frame(
+            mx.array([first_codebook], dtype=mx.int32),
+            hidden,
+            cfg_scale=cfg_scale,
+            sampler=sampler,
+        )
+        return frame[0].tolist()
+
+    @staticmethod
+    def _left_pad(embeddings: list[mx.array]) -> tuple[mx.array, mx.array]:
+        """Stack prompts of different lengths, padding on the left.
+
+        Left padding keeps the real tokens contiguous at the end of every row,
+        so a shared cache offset is correct for all of them (RoPE only depends
+        on relative distance).  Returns the ``[batch, length, hidden]`` batch and
+        a ``[batch, length]`` boolean mask of real positions.
+        """
+        length = max(item.shape[1] for item in embeddings)
+        padded, valid = [], []
+        for item in embeddings:
+            pad = length - item.shape[1]
+            if pad:
+                filler = mx.zeros((1, pad, item.shape[2]), dtype=item.dtype)
+                item = mx.concatenate([filler, item], axis=1)
+            padded.append(item)
+            valid.append(mx.arange(length) >= pad)
+        return mx.concatenate(padded, axis=0), mx.stack(valid, axis=0)
 
     @staticmethod
     def _audio_vector(audio: Any) -> mx.array:
@@ -1011,7 +1145,14 @@ class Model(nn.Module):
         split_pattern: Optional[str] = "\n",
         **_: object,
     ) -> Generator[GenerationResult, None, None]:
-        """Generate Breeze audio for voice design, cloning, or direction."""
+        """Generate Breeze audio for voice design, cloning, or direction.
+
+        Each frame (first codebook, depth-decoded codebooks, and the next
+        backbone step) is built lazily and dispatched with ``mx.async_eval``.
+        The EOS check for a frame happens only after the following frame has
+        been queued, so the GPU never waits on Python.  With guidance the
+        conditional and unconditional prompts run as one batch of two.
+        """
         if seed is not None:
             mx.random.seed(seed)
         if max_tokens <= 0:
@@ -1054,40 +1195,92 @@ class Model(nn.Module):
             raise ValueError("Breeze audio tokenizer has no valid decode rate")
         chunk_frames = max(1, int(streaming_interval * self.sample_rate / decode_rate))
 
+        use_cfg = bool(instruct) and cfg_scale not in (None, 1.0)
+        scale = 1.0 if cfg_scale is None else cfg_scale
+        batch = 2 if use_cfg else 1
+        first_sampler = self._make_sampler(
+            temperature, top_p, top_k, self.vocab_size + 1
+        )
+        depth_sampler = self._make_sampler(temperature, top_p, top_k, self.vocab_size)
+
         total_segments = len(segments)
         for segment_idx, segment_text in enumerate(segments):
             is_last_segment = segment_idx == total_segments - 1
             started = time.perf_counter()
-            cond = self._prompt_embeddings(
-                segment_text,
-                voice=voice,
-                instruct=instruct,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
-            use_cfg = bool(instruct) and cfg_scale not in (None, 1.0)
-            scale = 1.0 if cfg_scale is None else cfg_scale
-            if use_cfg:
-                uncond = self._prompt_embeddings(
+            prompts = [
+                self._prompt_embeddings(
                     segment_text,
                     voice=voice,
-                    instruct=None,
+                    instruct=instruct,
                     ref_audio=ref_audio,
                     ref_text=ref_text,
                 )
-
-            cond_cache = self.backbone_model.make_cache()
-            cond_hidden = self.backbone_model(input_embeddings=cond, cache=cond_cache)[
-                :, -1, :
             ]
             if use_cfg:
-                uncond_cache = self.backbone_model.make_cache()
-                uncond_hidden = self.backbone_model(
-                    input_embeddings=uncond, cache=uncond_cache
-                )[:, -1, :]
+                prompts.append(
+                    self._prompt_embeddings(
+                        segment_text,
+                        voice=voice,
+                        instruct=None,
+                        ref_audio=ref_audio,
+                        ref_text=ref_text,
+                    )
+                )
 
-            frames: list[list[int]] = []
-            pending_frames: list[list[int]] = []
+            cache = self.backbone_model.make_cache()
+            if use_cfg:
+                embeddings, valid = self._left_pad(prompts)
+                length = embeddings.shape[1]
+                causal = mx.tril(mx.ones((length, length), dtype=mx.bool_))
+                # Real queries never attend to padding; padded queries attend
+                # causally to anything so their rows stay finite.
+                prefill_mask = causal[None, None] & (
+                    valid[:, None, None, :] | ~valid[:, None, :, None]
+                )
+                # Keys generated later are always valid.
+                key_valid = mx.concatenate(
+                    [valid, mx.ones((batch, max_tokens + 1), dtype=mx.bool_)], axis=1
+                )[:, None, None, :]
+                mx.eval(embeddings, prefill_mask, key_valid)
+                hidden = self.backbone_model(
+                    input_embeddings=embeddings, cache=cache, mask=prefill_mask
+                )[:, -1, :]
+                offset = length
+            else:
+                hidden = self.backbone_model(input_embeddings=prompts[0], cache=cache)[
+                    :, -1, :
+                ]
+
+            def backbone_step(frame: mx.array) -> mx.array:
+                nonlocal offset
+                codebooks = mx.broadcast_to(
+                    frame[:, None, :], (batch, 1, frame.shape[1])
+                )
+                if use_cfg:
+                    offset += 1
+                    return self.backbone_model(
+                        input_ids=codebooks, cache=cache, mask=key_valid[..., :offset]
+                    )[:, -1, :]
+                return self.backbone_model(input_ids=codebooks, cache=cache)[:, -1, :]
+
+            history = mx.zeros((0,), dtype=mx.int32)
+
+            def next_frame(hidden: mx.array) -> tuple[mx.array, mx.array]:
+                logits = self._cfg_mix(self.lm_head(hidden), scale)
+                logits = self._apply_repetition_penalty(
+                    logits, history, repetition_penalty
+                )
+                logits = self._mask_reserved_codec_logits(logits)
+                first = self._sample_array(
+                    logits, sampler=first_sampler, valid=self.vocab_size + 1
+                ).astype(mx.int32)
+                frame = self._depth_frame(
+                    first, hidden, cfg_scale=scale, sampler=depth_sampler
+                )
+                return first, frame
+
+            frames: list[mx.array] = []
+            pending_frames: list[mx.array] = []
             if stream:
                 self.audio_tokenizer.decoder.reset_streaming_state()
 
@@ -1121,55 +1314,42 @@ class Model(nn.Module):
                     is_final_chunk=final and is_last_segment,
                 )
 
+            def stream_chunk(chunk: list[mx.array], final: bool):
+                codes = mx.concatenate(chunk, axis=0)[None, :, :]
+                audio = self.audio_tokenizer.decoder.streaming_step(
+                    mx.transpose(codes, (0, 2, 1))
+                )
+                return stream_result(self._audio_vector(audio), len(chunk), final)
+
+            # ``previous`` is the last frame whose EOS flag has not been read.
+            # The following frame is dispatched before that read, so the GPU
+            # stays busy while Python waits.  If EOS fires, the extra frame is
+            # simply discarded.
+            previous: Optional[tuple[mx.array, mx.array]] = None
             for _ in range(max_tokens):
-                cond_logits = self.lm_head(cond_hidden)
-                if use_cfg:
-                    uncond_logits = self.lm_head(uncond_hidden)
-                    logits = uncond_logits + scale * (cond_logits - uncond_logits)
-                else:
-                    logits = cond_logits
-                logits = self._apply_repetition_penalty(
-                    logits, [frame[0] for frame in frames], repetition_penalty
-                )
-                logits = self._mask_reserved_codec_logits(logits)
-                first = self._sample(
-                    logits,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    allow_eos=True,
-                )
-                if first == self.vocab_size:
-                    break
-                frame = self._depth_tokens(
-                    first,
-                    cond_hidden,
-                    unconditional_hidden=uncond_hidden if use_cfg else None,
-                    cfg_scale=scale,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                )
-                frames.append(frame)
-                pending_frames.append(frame)
+                first, frame = next_frame(hidden)
+                hidden = backbone_step(frame)
+                if repetition_penalty != 1.0:
+                    history = mx.concatenate([history, first])
+                mx.async_eval(first, frame, hidden)
+                if previous is not None:
+                    if previous[0].item() == self.vocab_size:
+                        previous = None
+                        break
+                    frames.append(previous[1])
+                    pending_frames.append(previous[1])
+                    if stream and len(pending_frames) >= chunk_frames:
+                        chunk = pending_frames[:chunk_frames]
+                        del pending_frames[:chunk_frames]
+                        yield stream_chunk(chunk, final=False)
+                previous = (first, frame)
+            if previous is not None and previous[0].item() != self.vocab_size:
+                frames.append(previous[1])
+                pending_frames.append(previous[1])
                 if stream and len(pending_frames) >= chunk_frames:
                     chunk = pending_frames[:chunk_frames]
                     del pending_frames[:chunk_frames]
-                    pending_codes = mx.array(chunk, dtype=mx.int32)[None, :, :]
-                    stream_audio = self.audio_tokenizer.decoder.streaming_step(
-                        mx.transpose(pending_codes, (0, 2, 1))
-                    )
-                    yield stream_result(
-                        self._audio_vector(stream_audio), len(chunk), final=False
-                    )
-                codebooks = mx.array(frame, dtype=mx.int32)[None, None, :]
-                cond_hidden = self.backbone_model(
-                    input_ids=codebooks, cache=cond_cache
-                )[:, -1, :]
-                if use_cfg:
-                    uncond_hidden = self.backbone_model(
-                        input_ids=codebooks, cache=uncond_cache
-                    )[:, -1, :]
+                    yield stream_chunk(chunk, final=False)
 
             if not frames:
                 empty_audio = self._empty_audio()
@@ -1200,20 +1380,14 @@ class Model(nn.Module):
                 continue
             if stream:
                 if pending_frames:
-                    pending_codes = mx.array(pending_frames, dtype=mx.int32)[None, :, :]
-                    stream_audio = self.audio_tokenizer.decoder.streaming_step(
-                        mx.transpose(pending_codes, (0, 2, 1))
-                    )
+                    chunk, pending_frames = pending_frames, []
+                    result = stream_chunk(chunk, final=True)
                     self.audio_tokenizer.decoder.reset_streaming_state()
-                    yield stream_result(
-                        self._audio_vector(stream_audio),
-                        len(pending_frames),
-                        final=True,
-                    )
+                    yield result
                 else:
                     self.audio_tokenizer.decoder.reset_streaming_state()
                 continue
-            codes = mx.array(frames, dtype=mx.int32)[None, :, :]
+            codes = mx.concatenate(frames, axis=0)[None, :, :]
             audio = self._decode_codes(codes)
             samples = audio.shape[0]
             mx.eval(audio)
