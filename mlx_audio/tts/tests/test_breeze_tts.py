@@ -5,6 +5,7 @@ import pytest
 
 try:
     import mlx.core as mx
+    from mlx.utils import tree_flatten
 except (ImportError, RuntimeError) as exc:  # pragma: no cover - no Metal host
     pytest.skip(f"MLX device unavailable: {exc}", allow_module_level=True)
 
@@ -271,6 +272,80 @@ def test_exact_prompt_template_for_cloning_and_direction(monkeypatch):
     assert prompts == ["[S2]reference text", "[S2]<ins_bos>warm<ins_eos>target"]
 
 
+def test_reference_is_encoded_once_per_clip_and_again_when_the_clip_changes(
+    monkeypatch, tmp_path
+):
+    model = Model(tiny_config())
+    encoded = []
+    texts = []
+
+    def text_ids(value):
+        texts.append(value)
+        return mx.array([1, 2], dtype=mx.int32)
+
+    def encode(audio):
+        encoded.append(str(audio))
+        return mx.ones((1, 4, model.num_codebooks), mx.int32)
+
+    monkeypatch.setattr(model, "_text_ids", text_ids)
+    monkeypatch.setattr(model, "_encode_reference", encode)
+    clip = tmp_path / "voice.wav"
+    clip.write_bytes(b"first take")
+
+    def prompt(text, audio=clip, ref_text="reference text", voice="S0"):
+        return model._prompt_embeddings(
+            text, voice=voice, instruct=None, ref_audio=audio, ref_text=ref_text
+        )
+
+    first = prompt("one")
+    second = prompt("two")
+    assert len(encoded) == 1  # the clip went through the codec once
+    assert texts == ["[S0]reference text", "[S0]one", "[S0]two"]
+    assert first.shape == second.shape
+    assert mx.array_equal(first[:, :-2], second[:, :-2])  # the same reference part
+
+    # The cached prompt is the prompt that is built without a cache.
+    uncached = Model(tiny_config())
+    uncached.update(model.parameters())
+    monkeypatch.setattr(uncached, "_text_ids", lambda value: mx.array([1, 2], mx.int32))
+    monkeypatch.setattr(uncached, "_encode_reference", encode)
+    monkeypatch.setattr(Model, "_reference_key", staticmethod(lambda *a: None))
+    plain = uncached._prompt_embeddings(
+        "two", voice="S0", instruct=None, ref_audio=clip, ref_text="reference text"
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(model, "_text_ids", text_ids)
+    monkeypatch.setattr(model, "_encode_reference", encode)
+    assert mx.allclose(plain, second)
+
+    # Another transcript, another speaker tag, or a changed file is another reference.
+    count = len(encoded)
+    prompt("three", ref_text="other words")
+    prompt("three", voice="S1")
+    assert len(encoded) == count + 2
+    clip.write_bytes(b"a second, longer take")
+    prompt("four")
+    assert len(encoded) == count + 3
+    prompt("five")
+    assert len(encoded) == count + 3
+
+    # An array, or a file that is not there, is never cached.
+    prompt("six", audio=mx.zeros((1, 1, 10)))
+    prompt("six", audio=mx.zeros((1, 1, 10)))
+    prompt("seven", audio=tmp_path / "missing.wav")
+    prompt("seven", audio=tmp_path / "missing.wav")
+    assert len(encoded) == count + 7
+
+    # The cache is bounded, and it is not one of the model's parameters.
+    for i in range(Model.REFERENCE_CACHE_SIZE + 3):
+        other = tmp_path / f"voice{i}.wav"
+        other.write_bytes(b"x" * (i + 1))
+        prompt("eight", audio=other)
+    assert len(model._reference_cache) == Model.REFERENCE_CACHE_SIZE
+    names = [name for name, _ in tree_flatten(model.parameters())]
+    assert not any("reference_cache" in name for name in names)
+
+
 def test_stream_flushes_at_exact_interval_and_resets_state(monkeypatch):
     model = Model(tiny_config())
 
@@ -492,7 +567,10 @@ def test_sampler_varies_on_worker_threads_and_is_reproducible_with_a_key():
     mx.eval(logits)  # the first evaluation in a process must happen on the main thread
 
     def draws(sampler, n=12):
-        return [int(model._sample_array(logits, sampler=sampler, valid=8).item()) for _ in range(n)]
+        return [
+            int(model._sample_array(logits, sampler=sampler, valid=8).item())
+            for _ in range(n)
+        ]
 
     results = {}
 
@@ -503,10 +581,16 @@ def test_sampler_varies_on_worker_threads_and_is_reproducible_with_a_key():
     thread = threading.Thread(target=body)
     thread.start()
     thread.join()
-    assert len(set(results["a"])) > 1, "sampler returned one token forever on a worker thread"
-    assert results["a"] != results["b"], "two unseeded samplers drew identical sequences"
+    assert (
+        len(set(results["a"])) > 1
+    ), "sampler returned one token forever on a worker thread"
+    assert (
+        results["a"] != results["b"]
+    ), "two unseeded samplers drew identical sequences"
 
     seeded_1 = draws(model._make_sampler(0.9, 1.0, 4, 8, key=mx.random.key(3)))
     seeded_2 = draws(model._make_sampler(0.9, 1.0, 4, 8, key=mx.random.key(3)))
     assert seeded_1 == seeded_2
-    assert max(seeded_1) <= 7 and all(t in (3, 7, 2, 6) for t in seeded_1)  # top-4 of the distribution only
+    assert max(seeded_1) <= 7 and all(
+        t in (3, 7, 2, 6) for t in seeded_1
+    )  # top-4 of the distribution only

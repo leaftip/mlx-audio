@@ -11,6 +11,7 @@ import math
 import os
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Union
 
@@ -898,6 +899,64 @@ class Model(nn.Module):
             )
         return mx.transpose(self.audio_tokenizer.encode(audio), (0, 2, 1))
 
+    # A cloned voice sends the same reference clip and transcript with every
+    # utterance. Encoding the clip and embedding both is the same work each
+    # time, so the result is kept per clip. The name starts with an underscore
+    # so the arrays are not taken for parameters of the module.
+    REFERENCE_CACHE_SIZE = 8
+
+    @staticmethod
+    def _reference_key(
+        speaker: str, ref_audio: Any, ref_text: Optional[str]
+    ) -> Optional[tuple]:
+        """Identify a reference by its file as it is now; None means do not cache."""
+        if not isinstance(ref_audio, (str, Path)):
+            return None
+        try:
+            stat = os.stat(ref_audio)
+        except OSError:
+            return None
+        return (
+            speaker,
+            ref_text,
+            os.path.abspath(str(ref_audio)),
+            stat.st_mtime_ns,
+            stat.st_size,
+        )
+
+    def _reference_embeddings(
+        self,
+        speaker: str,
+        ref_audio: Union[str, Path, mx.array],
+        ref_text: Optional[str],
+    ) -> mx.array:
+        """The prompt's reference part: transcript, clip and end marker, embedded."""
+        cache = getattr(self, "_reference_cache", None)
+        if cache is None:
+            cache = self._reference_cache = OrderedDict()
+        key = self._reference_key(speaker, ref_audio, ref_text)
+        if key is not None and key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        hidden = self.text_encoder(self._text_ids(f"{speaker}{ref_text}")[None, :])
+        eos_codes = mx.full(
+            (1, 1, self.num_codebooks), self.config.codebook_eos_token_id
+        )
+        reference = mx.concatenate(
+            [
+                self.text_encoder_proj(hidden),
+                self.backbone_model.embed_tokens(self._encode_reference(ref_audio)),
+                self.backbone_model.embed_tokens(eos_codes),
+            ],
+            axis=1,
+        )
+        if key is not None:
+            mx.eval(reference)
+            cache[key] = reference
+            while len(cache) > self.REFERENCE_CACHE_SIZE:
+                cache.popitem(last=False)
+        return reference
+
     def _prompt_embeddings(
         self,
         text: str,
@@ -922,26 +981,14 @@ class Model(nn.Module):
         if ref_audio is not None and not ref_text:
             raise ValueError("Breeze voice cloning requires ref_text with ref_audio.")
         speaker = self._speaker(voice)
-        segments: list[tuple[str, mx.array]] = []
+        embeddings: list[mx.array] = []
         if ref_audio is not None:
-            segments.append(("text", self._text_ids(f"{speaker}{ref_text}")))
-            segments.append(("audio", self._encode_reference(ref_audio)))
+            embeddings.append(self._reference_embeddings(speaker, ref_audio, ref_text))
         target = f"{speaker}{text}"
         if instruct:
             target = f"{speaker}<ins_bos>{instruct}<ins_eos>{text}"
-        segments.append(("text", self._text_ids(target)))
-
-        embeddings: list[mx.array] = []
-        for kind, values in segments:
-            if kind == "text":
-                hidden = self.text_encoder(values[None, :])
-                embeddings.append(self.text_encoder_proj(hidden))
-            else:
-                embeddings.append(self.backbone_model.embed_tokens(values))
-                eos_codes = mx.full(
-                    (1, 1, self.num_codebooks), self.config.codebook_eos_token_id
-                )
-                embeddings.append(self.backbone_model.embed_tokens(eos_codes))
+        hidden = self.text_encoder(self._text_ids(target)[None, :])
+        embeddings.append(self.text_encoder_proj(hidden))
         return mx.concatenate(embeddings, axis=1)
 
     def _make_sampler(
